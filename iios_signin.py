@@ -22,12 +22,26 @@ DEFAULT_MOBILE_UA = (
 DEFAULT_VIEWPORT = {"width": 390, "height": 844}
 DEFAULT_TIMEOUT_MS = 20_000
 DEFAULT_LOCALE = "zh-CN"
+LOGIN_CONFIRM_ATTEMPTS = 4
+LOGIN_CONFIRM_WAIT_MS = 3_000
 ALREADY_SIGNED_TEXTS = (
     "今日已签到",
     "已签到",
     "签到成功",
+    "已完成",
+    "以完成",
+    "今日已完成",
+    "已完成签到",
+    "签到完成",
+    "明日再来",
 )
 SIGNIN_TEXT = "立即签到"
+SIGNIN_ACTION_TEXTS = (
+    "立即签到",
+    "去签到",
+    "马上签到",
+    "点击签到",
+)
 SIGNED_OUT_HINT_TEXTS = (
     "登录",
     "立即登录",
@@ -280,6 +294,20 @@ def unique_visible_locator(page: Page, candidates: list[str]) -> Locator | None:
     return None
 
 
+def login_form_present(page: Page) -> bool:
+    try:
+        for root in login_roots(page):
+            password_field = first_visible(password_candidates(root))
+            if password_field is None:
+                continue
+            username_field = first_visible(username_candidates(root))
+            if username_field is not None:
+                return True
+        return False
+    except Error:
+        return False
+
+
 def open_home(page: Page) -> None:
     log("login", "opening home page", url=LOGIN_URL)
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
@@ -303,6 +331,8 @@ def looks_logged_in(page: Page) -> bool:
         return True
     if any(marker in text for marker in SIGNED_OUT_HINT_TEXTS):
         return False
+    if page.url.startswith(POINTS_URL) and not login_form_present(page):
+        return True
     return False
 
 
@@ -413,6 +443,16 @@ def submit_login(page: Page, config: Config) -> None:
     page.wait_for_timeout(2_000)
 
 
+def wait_for_login_confirmation(page: Page) -> bool:
+    for attempt in range(1, LOGIN_CONFIRM_ATTEMPTS + 1):
+        open_points_page(page)
+        if looks_logged_in(page):
+            log("login", "login confirmation matched", attempt=attempt, url=page.url)
+            return True
+        page.wait_for_timeout(LOGIN_CONFIRM_WAIT_MS)
+    return False
+
+
 def ensure_logged_in(page: Page, config: Config) -> None:
     open_points_page(page)
     if looks_logged_in(page):
@@ -421,8 +461,7 @@ def ensure_logged_in(page: Page, config: Config) -> None:
         return
     open_home(page)
     submit_login(page, config)
-    open_points_page(page)
-    if not looks_logged_in(page):
+    if not wait_for_login_confirmation(page):
         raise_with_screenshot(page, config, "login_not_confirmed", "Login did not appear to succeed.")
     log("login", "login succeeded", url=page.url)
     maybe_capture_success(page, config, "points_logged_in")
@@ -440,22 +479,51 @@ def already_signed_in(page: Page) -> bool:
     return any(marker in text for marker in ALREADY_SIGNED_TEXTS)
 
 
-def locate_signin_action(page: Page) -> Locator | None:
+def points_panel_text(page: Page) -> str:
     candidates = [
-        f"button:has-text('{SIGNIN_TEXT}')",
-        f"a:has-text('{SIGNIN_TEXT}')",
-        f"[role='button']:has-text('{SIGNIN_TEXT}')",
+        page.locator("main"),
+        page.locator("[class*='point' i], [class*='score' i], [class*='sign' i], [class*='check' i]"),
+        page.locator("body"),
     ]
-    locator = unique_visible_locator(page, candidates)
-    if locator is not None:
-        return locator
+    for locator in candidates:
+        try:
+            target = locator.first
+            if target.count() > 0 and target.is_visible(timeout=1_000):
+                return target.inner_text(timeout=3_000)
+        except Error:
+            continue
+    return current_page_text(page)
 
-    text_locator = page.get_by_text(SIGNIN_TEXT, exact=True)
-    try:
-        if text_locator.count() == 1 and text_locator.first.is_visible(timeout=1_000):
-            return text_locator.first
-    except Error:
-        return None
+
+def points_state_completed(page: Page) -> bool:
+    text = points_panel_text(page)
+    return any(marker in text for marker in ALREADY_SIGNED_TEXTS)
+
+
+def locate_signin_action(page: Page) -> Locator | None:
+    for text in SIGNIN_ACTION_TEXTS:
+        role_button = page.get_by_role("button", name=text)
+        try:
+            if role_button.first.count() > 0 and role_button.first.is_visible(timeout=1_500):
+                return role_button.first
+        except Error:
+            pass
+
+        candidates = [
+            f"button:has-text('{text}')",
+            f"a:has-text('{text}')",
+            f"[role='button']:has-text('{text}')",
+        ]
+        locator = unique_visible_locator(page, candidates)
+        if locator is not None:
+            return locator
+
+        text_locator = page.get_by_text(text, exact=True)
+        try:
+            if text_locator.count() == 1 and text_locator.first.is_visible(timeout=1_000):
+                return text_locator.first
+        except Error:
+            continue
     return None
 
 
@@ -470,13 +538,17 @@ def verify_mobile_ua(page: Page, expected_user_agent: str) -> None:
 
 
 def handle_signin(page: Page, config: Config) -> str:
-    if already_signed_in(page):
+    if already_signed_in(page) or points_state_completed(page):
         log("points", "already signed in for today", url=page.url)
         maybe_capture_success(page, config, "result_already_signed")
         return "already_signed"
 
     action = locate_signin_action(page)
     if action is None:
+        if points_state_completed(page):
+            log("points", "completed-state text detected without sign-in button", url=page.url)
+            maybe_capture_success(page, config, "result_already_signed")
+            return "already_signed"
         raise_with_screenshot(page, config, "signin_action_not_found", "Could not safely locate the '立即签到' action.")
 
     log("points", "found sign-in action", url=page.url)
