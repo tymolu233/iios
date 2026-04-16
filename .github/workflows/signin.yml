@@ -49,7 +49,7 @@ jobs:
         run: uv run python -m cloakbrowser install
 
       - name: Run sign-in
-        run: uv run python iios_signin.py --dry-run
+        run: uv run python iios_signin.py --no-dry-run
 
       - name: Upload artifacts
         if: always()
