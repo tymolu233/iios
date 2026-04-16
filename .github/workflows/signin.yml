@@ -50,11 +50,3 @@ jobs:
 
       - name: Run sign-in
         run: uv run python iios_signin.py --no-dry-run
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: iios-signin-artifacts
-          path: data/artifacts/
-          if-no-files-found: ignore
