@@ -1,0 +1,51 @@
+name: iios sign-in
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 0 * * *'
+
+jobs:
+  sign-in:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IIOS_USERNAME: ${{ secrets.IIOS_USERNAME }}
+      IIOS_PASSWORD: ${{ secrets.IIOS_PASSWORD }}
+      CLOAK_FINGERPRINT_SEED: ${{ secrets.CLOAK_FINGERPRINT_SEED }}
+      CLOAK_HEADLESS: 'true'
+      IIOS_TIMEOUT_MS: '30000'
+      IIOS_LOG_LEVEL: info
+      IIOS_SUCCESS_SCREENSHOT: 'false'
+      IIOS_PROFILE_DIR: data/profile/iios.fun
+      IIOS_ARTIFACT_DIR: data/artifacts/iios.fun
+      IIOS_USER_AGENT: Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 Mobile/15E148 Safari/604.1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Prepare dependencies
+        run: uv sync --locked --no-dev
+
+      - name: Install CloakBrowser binary
+        run: uv run python -m cloakbrowser install
+
+      - name: Run sign-in
+        run: uv run python iios_signin.py --no-dry-run
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iios-signin-artifacts
+          path: data/artifacts/
+          if-no-files-found: ignore

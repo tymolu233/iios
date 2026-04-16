@@ -96,6 +96,33 @@ docker compose run --rm iios-signin --no-dry-run
 
 The profile directory and artifact directory are mounted from the host so session state and screenshots survive container replacement.
 
+## GitHub Actions
+
+You can also run the sign-in script from GitHub Actions without Docker.
+
+### Required repository secrets
+
+- `IIOS_USERNAME`
+- `IIOS_PASSWORD`
+- `CLOAK_FINGERPRINT_SEED` (strongly recommended, for a stable fingerprint and more repeatable runs)
+
+### Workflow
+
+The workflow file is stored at `.github/workflows/signin.yml` and supports:
+
+- manual trigger via `workflow_dispatch`
+- scheduled trigger via cron
+
+It installs Python 3.13, installs `uv`, syncs dependencies, downloads the CloakBrowser binary, and runs:
+
+```powershell
+uv run python iios_signin.py --no-dry-run
+```
+
+The workflow uploads the contents of `data/artifacts/` as workflow artifacts. Those uploaded files may contain screenshots or other run artifacts with account/session-visible content, so treat them as sensitive.
+
+Because GitHub-hosted runners are ephemeral, do **not** rely on `data/profile/` for long-lived persistent sessions there. The workflow should be treated as an independent login run each time.
+
 ## Notes
 
 - `smoke_test.py` only validates CloakBrowser itself.
