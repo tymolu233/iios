@@ -119,6 +119,8 @@ It installs Python 3.13, installs `uv`, syncs dependencies, downloads the CloakB
 uv run python iios_signin.py --no-dry-run
 ```
 
+The workflow also installs Chinese locale/font support (`zh_CN.UTF-8` and Noto CJK fonts) so pages that rely on Chinese text rendering are more likely to display and match correctly.
+
 The workflow uploads the contents of `data/artifacts/` as workflow artifacts. Those uploaded files may contain screenshots or other run artifacts with account/session-visible content, so treat them as sensitive.
 
 Because GitHub-hosted runners are ephemeral, do **not** rely on `data/profile/` for long-lived persistent sessions there. The workflow should be treated as an independent login run each time.

@@ -21,6 +21,7 @@ DEFAULT_MOBILE_UA = (
 )
 DEFAULT_VIEWPORT = {"width": 390, "height": 844}
 DEFAULT_TIMEOUT_MS = 20_000
+DEFAULT_LOCALE = "zh-CN"
 ALREADY_SIGNED_TEXTS = (
     "今日已签到",
     "已签到",
@@ -75,6 +76,7 @@ class Config:
     artifact_dir: Path
     log_level: str
     success_screenshot: bool
+    locale: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,6 +113,11 @@ def parse_args() -> argparse.Namespace:
         "--user-agent",
         default=os.getenv("IIOS_USER_AGENT", DEFAULT_MOBILE_UA),
         help="User agent override for the persistent context.",
+    )
+    parser.add_argument(
+        "--locale",
+        default=os.getenv("IIOS_LOCALE", DEFAULT_LOCALE),
+        help="Locale passed to the browser context.",
     )
     parser.add_argument(
         "--artifact-dir",
@@ -180,6 +187,7 @@ def load_config(args: argparse.Namespace) -> Config:
         artifact_dir=artifact_dir,
         log_level=args.log_level.strip().lower() or DEFAULT_LOG_LEVEL,
         success_screenshot=args.success_screenshot,
+        locale=args.locale.strip() or DEFAULT_LOCALE,
     )
 
 
@@ -500,7 +508,7 @@ def main() -> None:
         str(config.profile_dir),
         user_agent=config.user_agent,
         viewport=DEFAULT_VIEWPORT,
-        locale="en-US",
+        locale=config.locale,
         args=[f"--fingerprint={config.fingerprint_seed}"],
         headless=config.headless,
         humanize=True,

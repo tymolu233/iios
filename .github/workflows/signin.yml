@@ -14,11 +14,14 @@ jobs:
       IIOS_PASSWORD: ${{ secrets.IIOS_PASSWORD }}
       CLOAK_FINGERPRINT_SEED: ${{ secrets.CLOAK_FINGERPRINT_SEED }}
       CLOAK_HEADLESS: 'true'
+      LANG: zh_CN.UTF-8
+      LC_ALL: zh_CN.UTF-8
       IIOS_TIMEOUT_MS: '30000'
       IIOS_LOG_LEVEL: info
       IIOS_SUCCESS_SCREENSHOT: 'false'
       IIOS_PROFILE_DIR: data/profile/iios.fun
       IIOS_ARTIFACT_DIR: data/artifacts/iios.fun
+      IIOS_LOCALE: zh-CN
       IIOS_USER_AGENT: Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 Mobile/15E148 Safari/604.1
 
     steps:
@@ -32,6 +35,12 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+
+      - name: Install Chinese fonts and locale support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk locales
+          sudo locale-gen zh_CN.UTF-8
 
       - name: Prepare dependencies
         run: uv sync --locked --no-dev
