@@ -1,135 +1,66 @@
-# CloakBrowser local setup
+# iios 纯协议每日签到
 
-This workspace is managed with `uv` and targets Python 3.13+.
+本地 WASM 加解密 + `urllib` 裸 HTTP，**不打开浏览器**。
 
-## Setup
+## 依赖
 
-```powershell
-uv python install 3.13
-uv python pin 3.13
-uv sync
-uv run python -m cloakbrowser install
-uv run python -m cloakbrowser info
-```
+- Python 3.11+
+- Node.js 18+（运行 `crypto/wasm_crypto.cjs`）
 
-If the binary download is interrupted, rerun `uv run python -m cloakbrowser install`.
-
-## Smoke tests
+## 配置
 
 ```powershell
-uv run python smoke_test.py --mode basic
-uv run python smoke_test.py --mode mobile
-uv run python smoke_test.py --mode persistent
+$env:IIOS_USERNAME="you@example.com"
+$env:IIOS_PASSWORD="secret"
+# 可选
+$env:IIOS_BASE_URL="https://www.iios.fun"   # 或 https://www.iios.me
+$env:IIOS_WEBAPP="true"                     # 默认 true；false 则普通 1 积分
+$env:IIOS_USER_AGENT="Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 Mobile/15E148 Safari/604.1"
 ```
 
-The smoke tests default to a local `data:` page, so they do not require external network access.
+也可复制 `.env.example` 自行导出变量。
 
-## iios.fun sign-in script
-
-Set credentials in your environment, then run a dry-run first:
+## 运行
 
 ```powershell
-$env:IIOS_USERNAME="your-email@example.com"
-$env:IIOS_PASSWORD="your-password"
-uv run python iios_signin.py --dry-run
+cd C:\Users\tymol\Desktop\github\sing
+
+python iios_signin.py --selftest      # 加密 + 首页探测
+python iios_signin.py --dry-run       # 登录 + 查任务，不签到
+python iios_signin.py --no-dry-run         # 真实签到（默认 webapp=true）
+python iios_signin.py --no-dry-run --no-webapp   # 强制 webapp=false
 ```
 
-`--dry-run` skips the final `立即签到` click, but it may still perform a real login and persist session cookies in the configured profile directory.
+日志 JSON 中 `result`：
 
-When dry-run confirms that login works and the `立即签到` button is found, run the real flow:
+| 值 | 含义 |
+|----|------|
+| `already_signed` | 今日已签 |
+| `dry_run_ready` | dry-run 通过，尚未提交 |
+| `signed_now` | 本次签到成功 |
 
-```powershell
-uv run python iios_signin.py --no-dry-run
+## 目录
+
 ```
-
-For troubleshooting, you can also enable success screenshots:
-
-```powershell
-uv run python iios_signin.py --dry-run --success-screenshot
+crypto/                 # WASM + glue（必需）
+  wasm_crypto.cjs
+  main.*.js
+  web_wasm_bg.*.wasm
+iios_signin.py          # 入口
+.github/workflows/      # 可选定时任务
 ```
-
-Failure screenshots are saved automatically under `data/artifacts/iios.fun/` by default. These images may contain account/session-visible data, so treat them as sensitive local files. The same sensitivity warning applies to optional success screenshots.
-
-## Docker
-
-This project can run on top of the official CloakBrowser container image.
-
-### Build
-
-```powershell
-docker build -t iios-cloak-signin .
-```
-
-### Dry-run with Docker
-
-```powershell
-docker run --rm `
-  --env-file .env `
-  -v ${PWD}/data/profile:/app/data/profile `
-  -v ${PWD}/data/artifacts:/app/data/artifacts `
-  iios-cloak-signin
-```
-
-### Real sign-in with Docker
-
-```powershell
-docker run --rm `
-  --env-file .env `
-  -v ${PWD}/data/profile:/app/data/profile `
-  -v ${PWD}/data/artifacts:/app/data/artifacts `
-  iios-cloak-signin --no-dry-run
-```
-
-### Docker Compose
-
-Create a local `.env` file from `.env.example`, then run:
-
-```powershell
-docker compose run --rm iios-signin
-```
-
-For a real sign-in run:
-
-```powershell
-docker compose run --rm iios-signin --no-dry-run
-```
-
-The profile directory and artifact directory are mounted from the host so session state and screenshots survive container replacement.
 
 ## GitHub Actions
 
-You can also run the sign-in script from GitHub Actions without Docker.
+Secrets：`IIOS_USERNAME`、`IIOS_PASSWORD`  
+可选 Variables：`IIOS_BASE_URL`、`IIOS_WEBAPP`  
 
-### Required repository secrets
+工作流：`.github/workflows/signin.yml`（定时 + 手动），只装 Python/Node。
 
-- `IIOS_USERNAME`
-- `IIOS_PASSWORD`
-- `CLOAK_FINGERPRINT_SEED` (strongly recommended, for a stable fingerprint and more repeatable runs)
+## 协议要点
 
-### Workflow
-
-The workflow file is stored at `.github/workflows/signin.yml` and supports:
-
-- manual trigger via `workflow_dispatch`
-- scheduled trigger via cron
-
-It installs Python 3.13, installs `uv`, syncs dependencies, downloads the CloakBrowser binary, and runs:
-
-```powershell
-uv run python iios_signin.py --no-dry-run
-```
-
-The workflow also installs Chinese locale/font support (`zh_CN.UTF-8` and Noto CJK fonts) so pages that rely on Chinese text rendering are more likely to display and match correctly.
-
-The workflow does not upload screenshots or local artifacts automatically.
-
-Because GitHub-hosted runners are ephemeral, do **not** rely on `data/profile/` for long-lived persistent sessions there. The workflow should be treated as an independent login run each time.
-
-## Notes
-
-- `smoke_test.py` only validates CloakBrowser itself.
-- `iios_signin.py` uses a persistent CloakBrowser profile and reads credentials from environment variables.
-- `iios_signin.py` stores reusable session state under the profile directory; treat that directory as sensitive local data.
-- `iios_signin.py` now emits structured JSON logs to stdout and saves failure screenshots locally.
-- `Dockerfile` is based on the official `cloakhq/cloakbrowser` image instead of building a browser runtime from scratch.
-- `.env.example` includes both CloakBrowser settings and iios.fun runtime variables. Do not commit real secrets.
+- `POST /api/user/login` → JWT  
+- `GET /api/task/all` → `checkIn`  
+- `POST /api/task` body `{type:2, webapp}`  
+- 加密时 `baseURL` 必须为 `"/api"`  
+- 请求 `User-Agent` 必须与 WASM 内 UA 一致  

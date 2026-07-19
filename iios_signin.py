@@ -1,79 +1,51 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+iios 每日签到 — 纯协议实现
+
+加解密：crypto/wasm_crypto.cjs（本地 WASM e/d）
+传输：urllib 裸 HTTP（默认 iOS Safari UA，一般无需 CF 挑战）
+业务：
+  POST /api/user/login  → JWT
+  GET  /api/task/all    → checkIn 状态
+  POST /api/task        → {type:2, webapp:bool}
+
+环境变量：
+  IIOS_USERNAME / IIOS_PASSWORD  账号
+  IIOS_BASE_URL                  默认 https://www.iios.fun
+  IIOS_USER_AGENT                请求/签名共用 UA
+  IIOS_WEBAPP                    默认 true（目标 2 积分）；false 则普通签到
+  IIOS_LOG_LEVEL                 debug|info|warning|error
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlparse
 
-from cloakbrowser import launch_persistent_context
-from playwright.sync_api import Error, Locator, Page
+DIR = Path(__file__).resolve().parent
+CRYPTO_DIR = DIR / "crypto"
+WASM_CLI = CRYPTO_DIR / "wasm_crypto.cjs"
+TOKEN_FILE = DIR / "data" / "token.json"
 
-
-LOGIN_URL = "https://www.iios.fun/"
-POINTS_URL = "https://www.iios.fun/#/points"
-DEFAULT_MOBILE_UA = (
+DEFAULT_BASE_URL = "https://www.iios.fun"
+DEFAULT_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 "
     "Mobile/15E148 Safari/604.1"
 )
-DEFAULT_VIEWPORT = {"width": 390, "height": 844}
-DEFAULT_TIMEOUT_MS = 20_000
-DEFAULT_LOCALE = "zh-CN"
-LOGIN_CONFIRM_ATTEMPTS = 4
-LOGIN_CONFIRM_WAIT_MS = 3_000
-ALREADY_SIGNED_TEXTS = (
-    "今日已签到",
-    "已签到",
-    "签到成功",
-    "已完成",
-    "以完成",
-    "今日已完成",
-    "已完成签到",
-    "签到完成",
-    "明日再来",
-)
-SIGNIN_TEXT = "立即签到"
-SIGNIN_ACTION_TEXTS = (
-    "立即签到",
-    "去签到",
-    "马上签到",
-    "点击签到",
-)
-SIGNED_OUT_HINT_TEXTS = (
-    "登录",
-    "立即登录",
-    "密码",
-    "邮箱",
-    "账号",
-)
-LOGGED_IN_HINT_TEXTS = (
-    "退出登录",
-    "我的积分",
-    "积分明细",
-    "签到记录",
-)
-LOGIN_BUTTON_TEXTS = (
-    "登录",
-    "立即登录",
-    "登 录",
-    "密码登录",
-    "账号登录",
-    "sign in",
-    "login",
-)
-USER_FIELD_RE = re.compile(r"邮箱|邮件|账号|用户名|手机号|手机号码|phone|mobile|email|account|login|user", re.I)
-PASSWORD_FIELD_RE = re.compile(r"密码|password|passcode", re.I)
-LOGIN_ROOT_SELECTOR = "[class*='login' i], [class*='signin' i], [id*='login' i], [id*='signin' i], [data-testid*='login' i], [data-test*='login' i]"
 DEFAULT_LOG_LEVEL = "info"
-LOG_LEVEL_PRIORITY = {
-    "debug": 10,
-    "info": 20,
-    "warning": 30,
-    "error": 40,
-}
+LOG_LEVEL_PRIORITY = {"debug": 10, "info": 20, "warning": 30, "error": 40}
 ACTIVE_LOG_LEVEL = DEFAULT_LOG_LEVEL
 
 
@@ -81,75 +53,30 @@ ACTIVE_LOG_LEVEL = DEFAULT_LOG_LEVEL
 class Config:
     username: str
     password: str
-    headless: bool
-    fingerprint_seed: str
+    base_url: str
+    host: str
     user_agent: str
-    profile_dir: Path
-    timeout_ms: int
+    webapp: bool
     dry_run: bool
-    artifact_dir: Path
     log_level: str
-    success_screenshot: bool
-    locale: str
+    timeout_s: int
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="iios.fun CloakBrowser auto sign-in")
-    parser.add_argument(
-        "--headless",
-        action=argparse.BooleanOptionalAction,
-        default=_env_bool("CLOAK_HEADLESS", True),
-        help="Launch the browser in headless mode.",
-    )
-    parser.add_argument(
-        "--profile-dir",
-        default=os.getenv("IIOS_PROFILE_DIR", "data/profile/iios.fun"),
-        help="Persistent profile directory.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Validate login and sign-in target without clicking the sign-in button.",
-    )
-    parser.add_argument(
-        "--timeout-ms",
-        type=int,
-        default=_env_int("IIOS_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
-        help="Default Playwright timeout in milliseconds.",
-    )
-    parser.add_argument(
-        "--fingerprint-seed",
-        default=os.getenv("CLOAK_FINGERPRINT_SEED", "12345"),
-        help="Stable CloakBrowser fingerprint seed.",
-    )
-    parser.add_argument(
-        "--user-agent",
-        default=os.getenv("IIOS_USER_AGENT", DEFAULT_MOBILE_UA),
-        help="User agent override for the persistent context.",
-    )
-    parser.add_argument(
-        "--locale",
-        default=os.getenv("IIOS_LOCALE", DEFAULT_LOCALE),
-        help="Locale passed to the browser context.",
-    )
-    parser.add_argument(
-        "--artifact-dir",
-        default=os.getenv("IIOS_ARTIFACT_DIR", "data/artifacts/iios.fun"),
-        help="Directory for screenshots and local run artifacts.",
-    )
-    parser.add_argument(
-        "--log-level",
-        default=os.getenv("IIOS_LOG_LEVEL", DEFAULT_LOG_LEVEL),
-        help="Structured log level label for stdout output.",
-    )
-    parser.add_argument(
-        "--success-screenshot",
-        action=argparse.BooleanOptionalAction,
-        default=_env_bool("IIOS_SUCCESS_SCREENSHOT", False),
-        help="Save screenshots on successful checkpoints.",
-    )
-    return parser.parse_args()
+def log(step: str, message: str, level: str = "info", **context: object) -> None:
+    normalized = level.strip().lower()
+    if LOG_LEVEL_PRIORITY.get(normalized, 20) < LOG_LEVEL_PRIORITY.get(
+        ACTIVE_LOG_LEVEL, 20
+    ):
+        return
+    record: dict[str, Any] = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "level": normalized,
+        "step": step,
+        "message": message,
+    }
+    if context:
+        record["context"] = context
+    print(json.dumps(record, ensure_ascii=False), flush=True)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -163,450 +90,403 @@ def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
         return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"Environment variable {name} must be an integer.") from exc
+    value = int(raw)
     if value <= 0:
-        raise ValueError(f"Environment variable {name} must be positive.")
+        raise ValueError(f"{name} must be positive")
     return value
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="iios pure-protocol daily sign-in")
+    p.add_argument(
+        "--dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Login + task/all only; skip POST /api/task (default: true)",
+    )
+    p.add_argument(
+        "--webapp",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("IIOS_WEBAPP", True),
+        help="Send webapp=true for 2-point desktop check-in (default: true)",
+    )
+    p.add_argument(
+        "--base-url",
+        default=os.getenv("IIOS_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
+        help="Site origin, e.g. https://www.iios.fun",
+    )
+    p.add_argument(
+        "--user-agent",
+        default=os.getenv("IIOS_USER_AGENT", DEFAULT_UA),
+        help="Must match crypto sandbox UA (signature binds UA)",
+    )
+    p.add_argument(
+        "--timeout-s",
+        type=int,
+        default=_env_int("IIOS_TIMEOUT_S", 45),
+        help="HTTP timeout seconds",
+    )
+    p.add_argument(
+        "--log-level",
+        default=os.getenv("IIOS_LOG_LEVEL", DEFAULT_LOG_LEVEL),
+        help="debug|info|warning|error",
+    )
+    p.add_argument(
+        "--selftest",
+        action="store_true",
+        help="Only test WASM encrypt + bare GET home",
+    )
+    return p.parse_args()
 
 
 def load_config(args: argparse.Namespace) -> Config:
     username = os.getenv("IIOS_USERNAME", "").strip()
     password = os.getenv("IIOS_PASSWORD", "").strip()
-    if not username:
-        raise ValueError("Missing IIOS_USERNAME environment variable.")
-    if not password:
-        raise ValueError("Missing IIOS_PASSWORD environment variable.")
-    if not args.fingerprint_seed.strip():
-        raise ValueError("Fingerprint seed must not be empty.")
-    if args.timeout_ms <= 0:
-        raise ValueError("--timeout-ms must be a positive integer.")
-
-    profile_dir = Path(args.profile_dir)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    artifact_dir = Path(args.artifact_dir)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-
+    if not args.selftest:
+        if not username:
+            raise ValueError("Missing IIOS_USERNAME")
+        if not password:
+            raise ValueError("Missing IIOS_PASSWORD")
+    base = args.base_url.rstrip("/")
+    host = urlparse(base).hostname or "www.iios.fun"
     return Config(
         username=username,
         password=password,
-        headless=args.headless,
-        fingerprint_seed=args.fingerprint_seed.strip(),
+        base_url=base,
+        host=host,
         user_agent=args.user_agent,
-        profile_dir=profile_dir,
-        timeout_ms=args.timeout_ms,
-        dry_run=args.dry_run,
-        artifact_dir=artifact_dir,
-        log_level=args.log_level.strip().lower() or DEFAULT_LOG_LEVEL,
-        success_screenshot=args.success_screenshot,
-        locale=args.locale.strip() or DEFAULT_LOCALE,
+        webapp=bool(args.webapp),
+        dry_run=bool(args.dry_run),
+        log_level=(args.log_level or DEFAULT_LOG_LEVEL).strip().lower(),
+        timeout_s=args.timeout_s,
     )
 
 
-def log(step: str, message: str, level: str = "info", **context: object) -> None:
-    normalized_level = level.strip().lower()
-    active_priority = LOG_LEVEL_PRIORITY.get(ACTIVE_LOG_LEVEL, LOG_LEVEL_PRIORITY[DEFAULT_LOG_LEVEL])
-    message_priority = LOG_LEVEL_PRIORITY.get(normalized_level, LOG_LEVEL_PRIORITY[DEFAULT_LOG_LEVEL])
-    if message_priority < active_priority:
-        return
-    record = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "level": normalized_level,
-        "step": step,
-        "message": message,
+def node_crypto(cmd: str, payload: dict) -> dict:
+    if not WASM_CLI.is_file():
+        raise FileNotFoundError(f"missing {WASM_CLI}")
+    proc = subprocess.run(
+        ["node", str(WASM_CLI), cmd, "-"],
+        input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        capture_output=True,
+        cwd=str(CRYPTO_DIR),
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace")
+        raise RuntimeError(f"wasm_crypto {cmd} failed:\n{err}")
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    idx = out.find("{")
+    if idx < 0:
+        raise RuntimeError(f"no json from wasm_crypto: {out[:200]}")
+    return json.loads(out[idx:])
+
+
+def http_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    body: Optional[str],
+    user_agent: str,
+    timeout_s: int,
+) -> dict[str, Any]:
+    h = {
+        "User-Agent": user_agent,
+        "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+        "Accept-Encoding": "identity",
     }
-    if context:
-        record["context"] = context
-    print(json.dumps(record, ensure_ascii=False), flush=True)
-
-
-def sanitize_label(label: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_")
-    return cleaned or "artifact"
-
-
-def capture_screenshot(page: Page, artifact_dir: Path, label: str) -> Path:
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    file_path = artifact_dir / f"{timestamp}_{sanitize_label(label)}.png"
-    page.screenshot(path=str(file_path), full_page=True)
-    log("artifact", "saved screenshot", path=str(file_path))
-    return file_path
-
-
-def maybe_capture_success(page: Page, config: Config, label: str) -> None:
-    if config.success_screenshot:
-        capture_screenshot(page, config.artifact_dir, label)
-
-
-def raise_with_screenshot(page: Page, config: Config, label: str, message: str) -> None:
-    capture_screenshot(page, config.artifact_dir, label)
-    raise RuntimeError(message)
-
-
-def configure_page(page: Page, timeout_ms: int) -> None:
-    page.set_default_timeout(timeout_ms)
-    page.set_default_navigation_timeout(timeout_ms)
-
-
-def locator_with_candidates(page: Page, candidates: list[str]) -> Locator | None:
-    for candidate in candidates:
-        locator = page.locator(candidate).first
-        try:
-            if locator.count() > 0 and locator.is_visible(timeout=1_000):
-                return locator
-        except Error:
-            continue
-    return None
-
-
-def first_visible(candidates: list[Locator], timeout_ms: int = 1_500) -> Locator | None:
-    for locator in candidates:
-        try:
-            candidate = locator.first
-            if candidate.count() > 0 and candidate.is_visible(timeout=timeout_ms):
-                return candidate
-        except Error:
-            continue
-    return None
-
-
-def clickable_text_locator(page: Page, text: str) -> Locator | None:
-    candidates = [
-        f"button:has-text('{text}')",
-        f"a:has-text('{text}')",
-        f"[role='button']:has-text('{text}')",
-        f"text={text}",
-    ]
-    return locator_with_candidates(page, candidates)
-
-
-def unique_visible_locator(page: Page, candidates: list[str]) -> Locator | None:
-    for candidate in candidates:
-        locator = page.locator(candidate)
-        try:
-            if locator.count() == 1 and locator.first.is_visible(timeout=1_000):
-                return locator.first
-        except Error:
-            continue
-    return None
-
-
-def login_form_present(page: Page) -> bool:
+    h.update(headers)
+    data = body.encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=h, method=method.upper())
     try:
-        for root in login_roots(page):
-            password_field = first_visible(password_candidates(root))
-            if password_field is None:
-                continue
-            username_field = first_visible(username_candidates(root))
-            if username_field is not None:
-                return True
-        return False
-    except Error:
-        return False
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            text = resp.read().decode("utf-8", "replace")
+            rh = {k.lower(): v for k, v in resp.headers.items()}
+            return {"status": resp.status, "text": text, "headers": rh}
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", "replace")
+        rh = {k.lower(): v for k, v in e.headers.items()} if e.headers else {}
+        return {"status": e.code, "text": text, "headers": rh}
 
 
-def open_home(page: Page) -> None:
-    log("login", "opening home page", url=LOGIN_URL)
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+class ProtocolClient:
+    def __init__(self, config: Config):
+        self.config = config
+        self.api_base = config.base_url + "/api"
 
-
-def open_points_page(page: Page) -> None:
-    log("points", "opening points page", url=POINTS_URL)
-    page.goto(POINTS_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(2_000)
-
-
-def looks_logged_in(page: Page) -> bool:
-    text = current_page_text(page)
-    if not text:
-        return False
-    if locate_signin_action(page) is not None:
-        return True
-    if any(marker in text for marker in LOGGED_IN_HINT_TEXTS):
-        return True
-    if page.url.startswith(POINTS_URL) and any(marker in text for marker in ALREADY_SIGNED_TEXTS):
-        return True
-    if any(marker in text for marker in SIGNED_OUT_HINT_TEXTS):
-        return False
-    if page.url.startswith(POINTS_URL) and not login_form_present(page):
-        return True
-    return False
-
-
-def try_open_password_login_mode(page: Page) -> None:
-    for text in ("密码登录", "账号登录", "登录"):
-        locator = clickable_text_locator(page, text)
-        if locator is None:
-            continue
-        try:
-            locator.click(timeout=1_000)
-            page.wait_for_timeout(1_000)
-            return
-        except Error:
-            continue
-
-
-def login_roots(page: Page) -> list[Locator]:
-    return [
-        page.get_by_role("dialog").filter(has=page.locator("input[type='password']")),
-        page.locator("form").filter(has=page.locator("input[type='password']")),
-        page.locator(LOGIN_ROOT_SELECTOR).filter(has=page.locator("input[type='password']")),
-        page.locator("body"),
-    ]
-
-
-def username_candidates(root: Locator) -> list[Locator]:
-    return [
-        root.get_by_label(USER_FIELD_RE),
-        root.get_by_placeholder(USER_FIELD_RE),
-        root.get_by_role("textbox", name=USER_FIELD_RE),
-        root.locator("input[autocomplete='username']"),
-        root.locator("input[autocomplete='email']"),
-        root.locator("input[inputmode='email']"),
-        root.locator("input[inputmode='tel']"),
-        root.locator("input[type='email']"),
-        root.locator("input[type='tel']"),
-        root.locator("input[name*='user' i], input[name*='email' i], input[name*='login' i], input[name*='account' i], input[name*='mobile' i], input[name*='phone' i]"),
-        root.locator("input[id*='user' i], input[id*='email' i], input[id*='login' i], input[id*='account' i], input[id*='mobile' i], input[id*='phone' i]"),
-        root.locator("input[aria-label*='邮箱'], input[aria-label*='账号'], input[aria-label*='用户名'], input[aria-label*='手机号'], input[aria-label*='手机号码']"),
-        root.locator("input[placeholder*='邮箱'], input[placeholder*='账号'], input[placeholder*='用户名'], input[placeholder*='手机号'], input[placeholder*='手机号码'], input[placeholder*='手机']"),
-        root.locator("input:not([type='hidden']):not([type='password']):not([type='search'])"),
-    ]
-
-
-def password_candidates(root: Locator) -> list[Locator]:
-    return [
-        root.get_by_label(PASSWORD_FIELD_RE),
-        root.get_by_placeholder(PASSWORD_FIELD_RE),
-        root.locator("input[type='password']"),
-        root.locator("input[autocomplete='current-password']"),
-        root.locator("input[name*='pass' i], input[id*='pass' i], input[placeholder*='pass' i], input[placeholder*='密码']"),
-    ]
-
-
-def find_login_fields(page: Page) -> tuple[Locator, Locator, Locator]:
-    try_open_password_login_mode(page)
-    page.wait_for_timeout(1_000)
-
-    for root in login_roots(page):
-        password_field = first_visible(password_candidates(root))
-        if password_field is None:
-            continue
-        username_field = first_visible(username_candidates(root))
-        if username_field is not None:
-            return root, username_field, password_field
-
-    raise RuntimeError("Could not reliably locate both username and password fields.")
-
-
-def locate_username_input(page: Page) -> Locator:
-    _, username_field, _ = find_login_fields(page)
-    return username_field
-
-
-def locate_password_input(page: Page) -> Locator:
-    _, _, password_field = find_login_fields(page)
-    return password_field
-
-
-def locate_login_button(root: Locator) -> Locator:
-    for text in LOGIN_BUTTON_TEXTS:
-        candidates = [
-            root.locator(f"button:has-text('{text}')"),
-            root.locator(f"a:has-text('{text}')"),
-            root.locator(f"[role='button']:has-text('{text}')"),
-            root.get_by_text(text, exact=True),
-        ]
-        locator = first_visible(candidates)
-        if locator is not None:
-            return locator
-    locator = first_visible([root.locator("button[type='submit']"), root.locator("input[type='submit']")])
-    if locator is None:
-        raise RuntimeError("Could not find the login button.")
-    return locator
-
-
-def submit_login(page: Page, config: Config) -> None:
-    log("login", "filling credential fields")
-    try:
-        login_root, username_field, password_field = find_login_fields(page)
-    except RuntimeError as exc:
-        raise_with_screenshot(page, config, "login_fields_not_found", str(exc))
-    username_field.fill(config.username)
-    password_field.fill(config.password)
-    log("login", "submitting login form")
-    locate_login_button(login_root).click()
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(2_000)
-
-
-def wait_for_login_confirmation(page: Page) -> bool:
-    for attempt in range(1, LOGIN_CONFIRM_ATTEMPTS + 1):
-        open_points_page(page)
-        if looks_logged_in(page):
-            log("login", "login confirmation matched", attempt=attempt, url=page.url)
-            return True
-        page.wait_for_timeout(LOGIN_CONFIRM_WAIT_MS)
-    return False
-
-
-def ensure_logged_in(page: Page, config: Config) -> None:
-    open_points_page(page)
-    if looks_logged_in(page):
-        log("login", "existing session appears valid via points page", url=page.url)
-        maybe_capture_success(page, config, "points_logged_in")
-        return
-    open_home(page)
-    submit_login(page, config)
-    if not wait_for_login_confirmation(page):
-        raise_with_screenshot(page, config, "login_not_confirmed", "Login did not appear to succeed.")
-    log("login", "login succeeded", url=page.url)
-    maybe_capture_success(page, config, "points_logged_in")
-
-
-def current_page_text(page: Page) -> str:
-    try:
-        return page.locator("body").inner_text(timeout=3_000)
-    except Error:
-        return ""
-
-
-def already_signed_in(page: Page) -> bool:
-    text = current_page_text(page)
-    return any(marker in text for marker in ALREADY_SIGNED_TEXTS)
-
-
-def points_panel_text(page: Page) -> str:
-    candidates = [
-        page.locator("main"),
-        page.locator("[class*='point' i], [class*='score' i], [class*='sign' i], [class*='check' i]"),
-        page.locator("body"),
-    ]
-    for locator in candidates:
-        try:
-            target = locator.first
-            if target.count() > 0 and target.is_visible(timeout=1_000):
-                return target.inner_text(timeout=3_000)
-        except Error:
-            continue
-    return current_page_text(page)
-
-
-def points_state_completed(page: Page) -> bool:
-    text = points_panel_text(page)
-    return any(marker in text for marker in ALREADY_SIGNED_TEXTS)
-
-
-def locate_signin_action(page: Page) -> Locator | None:
-    for text in SIGNIN_ACTION_TEXTS:
-        role_button = page.get_by_role("button", name=text)
-        try:
-            if role_button.first.count() > 0 and role_button.first.is_visible(timeout=1_500):
-                return role_button.first
-        except Error:
-            pass
-
-        candidates = [
-            f"button:has-text('{text}')",
-            f"a:has-text('{text}')",
-            f"[role='button']:has-text('{text}')",
-        ]
-        locator = unique_visible_locator(page, candidates)
-        if locator is not None:
-            return locator
-
-        text_locator = page.get_by_text(text, exact=True)
-        try:
-            if text_locator.count() == 1 and text_locator.first.is_visible(timeout=1_000):
-                return text_locator.first
-        except Error:
-            continue
-    return None
-
-
-def verify_mobile_ua(page: Page, expected_user_agent: str) -> None:
-    current_ua = page.evaluate("() => navigator.userAgent")
-    if current_ua != expected_user_agent:
-        raise RuntimeError(
-            "navigator.userAgent mismatch: "
-            f"expected {expected_user_agent!r}, got {current_ua!r}"
+    def api(
+        self,
+        method: str,
+        path: str,
+        data: Any = None,
+        token: Optional[str] = None,
+    ) -> dict[str, Any]:
+        enc = node_crypto(
+            "encrypt",
+            {
+                "method": method,
+                "url": path if path.startswith("/") else f"/{path}",
+                "baseURL": "/api",
+                "data": data,
+                "token": token,
+                "userAgent": self.config.user_agent,
+                "standalone": self.config.webapp,
+                "host": self.config.host,
+            },
         )
-    log("context", "mobile user agent verified", url=page.url)
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "text/plain",
+            "X-Timestamp": str(enc["timestamp"]),
+            "X-Signature": enc["signature"],
+            "Origin": self.config.base_url,
+            "Referer": self.config.base_url + "/",
+        }
+        if token:
+            headers["Authorization"] = "Basic " + token
+
+        full = self.api_base + (path if path.startswith("/") else f"/{path}")
+        method_u = method.upper()
+        body = enc.get("body") if method_u not in ("GET", "HEAD") else None
+
+        http = http_request(
+            method_u,
+            full,
+            headers=headers,
+            body=body,
+            user_agent=self.config.user_agent,
+            timeout_s=self.config.timeout_s,
+        )
+        text = http["text"]
+        status = http["status"]
+
+        plain = None
+        js = None
+        decrypt_error = None
+        looks_cipher = (
+            len(text) > 16
+            and status < 500
+            and not text.lstrip().startswith("<")
+            and text.strip() not in ("Forbidden", "forbidden")
+            and "Just a moment" not in text
+            and "error code:" not in text.lower()
+            and "Connection timed out" not in text
+        )
+        if looks_cipher:
+            try:
+                dec = node_crypto(
+                    "decrypt",
+                    {
+                        "data": text,
+                        "status": status,
+                        "headers": http.get("headers") or {},
+                        "config": {
+                            "method": method,
+                            "url": path if path.startswith("/") else f"/{path}",
+                            "baseURL": "/api",
+                            "headers": enc.get("headers") or headers,
+                        },
+                        "userAgent": self.config.user_agent,
+                        "host": self.config.host,
+                    },
+                )
+                plain = dec.get("plain")
+                if isinstance(plain, str):
+                    try:
+                        js = json.loads(plain)
+                    except json.JSONDecodeError:
+                        js = None
+                else:
+                    js = plain
+            except Exception as e:
+                decrypt_error = str(e)
+        else:
+            decrypt_error = f"not_ciphertext status={status} body={text[:100]!r}"
+
+        return {
+            "status": status,
+            "raw": text,
+            "plain": plain,
+            "json": js,
+            "decrypt_error": decrypt_error,
+            "request": {
+                "url": full,
+                "method": method_u,
+                "X-Timestamp": headers["X-Timestamp"],
+                "X-Signature": headers["X-Signature"][:40] + "…",
+            },
+        }
+
+    def login(self) -> str:
+        log("login", "POST /api/user/login", host=self.config.host)
+        r = self.api(
+            "post",
+            "/user/login",
+            data={"email": self.config.username, "password": self.config.password},
+        )
+        if r["decrypt_error"]:
+            log("login", "failed", level="error", **{k: r[k] for k in ("status", "decrypt_error")})
+            raise RuntimeError(f"login decrypt failed: {r['decrypt_error']}")
+        j = r["json"] or {}
+        token = (j.get("result") or {}).get("token") or j.get("token")
+        if not token:
+            raise RuntimeError(f"login no token: {j}")
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.write_text(
+            json.dumps({"token": token, "host": self.config.host}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        log("login", "ok", status=r["status"], token_head=token[:36] + "…")
+        return token
+
+    def task_all(self, token: str) -> dict:
+        log("task", "GET /api/task/all")
+        r = self.api("get", "/task/all", token=token)
+        if r["decrypt_error"]:
+            log("task", "failed", level="error", status=r["status"], error=r["decrypt_error"])
+            raise RuntimeError(f"task/all failed: {r['decrypt_error']}")
+        result = (r["json"] or {}).get("result") or {}
+        log(
+            "task",
+            "ok",
+            checkIn=result.get("checkIn"),
+            status=r["status"],
+        )
+        return r["json"] or {}
+
+    def checkin(self, token: str) -> dict:
+        payload = {"type": 2, "webapp": bool(self.config.webapp)}
+        log("checkin", "POST /api/task", payload=payload)
+        r = self.api("post", "/task", data=payload, token=token)
+        if r["decrypt_error"]:
+            # 412 body is still ciphertext usually — if decrypt works we're fine
+            log("checkin", "decrypt issue", level="warning", status=r["status"], error=r["decrypt_error"])
+        j = r["json"] or {}
+        msg = j.get("message") if isinstance(j, dict) else None
+        log(
+            "checkin",
+            "response",
+            status=r["status"],
+            success=j.get("success") if isinstance(j, dict) else None,
+            message=msg,
+            result=j.get("result") if isinstance(j, dict) else None,
+        )
+        return {"status": r["status"], "json": j, "plain": r["plain"]}
 
 
-def handle_signin(page: Page, config: Config) -> str:
-    if already_signed_in(page) or points_state_completed(page):
-        log("points", "already signed in for today", url=page.url)
-        maybe_capture_success(page, config, "result_already_signed")
-        return "already_signed"
+def selftest(config: Config) -> int:
+    log("selftest", "encrypt", ua=config.user_agent[:50], host=config.host)
+    enc = node_crypto(
+        "encrypt",
+        {
+            "method": "post",
+            "url": "/task",
+            "baseURL": "/api",
+            "data": {"type": 2, "webapp": True},
+            "userAgent": config.user_agent,
+            "standalone": True,
+            "host": config.host,
+        },
+    )
+    log("selftest", "encrypt ok", ts=enc["timestamp"], sig_head=enc["signature"][:32])
+    req = urllib.request.Request(
+        config.base_url + "/",
+        headers={"User-Agent": config.user_agent, "Accept": "text/html"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = resp.read(400).decode("utf-8", "replace")
+            cf = (
+                "Just a moment" in html
+                or "cf-browser-verification" in html
+                or "安全验证" in html
+            )
+            log(
+                "selftest",
+                "home",
+                status=resp.status,
+                cf_challenge=cf,
+                html_head=html[:60],
+            )
+    except Exception as e:
+        log("selftest", "home failed", level="warning", error=str(e))
+        return 1
+    log("selftest", "PASS")
+    return 0
 
-    action = locate_signin_action(page)
-    if action is None:
-        if points_state_completed(page):
-            log("points", "completed-state text detected without sign-in button", url=page.url)
-            maybe_capture_success(page, config, "result_already_signed")
-            return "already_signed"
-        raise_with_screenshot(page, config, "signin_action_not_found", "Could not safely locate the '立即签到' action.")
 
-    log("points", "found sign-in action", url=page.url)
-    if config.dry_run:
-        log("dry-run", "sign-in click skipped", url=page.url)
-        maybe_capture_success(page, config, "result_dry_run_ready")
-        return "dry_run_ready"
-
-    log("points", "clicking sign-in action")
-    action.click()
-    page.wait_for_timeout(2_000)
-
-    if already_signed_in(page):
-        log("points", "sign-in confirmed by updated page state", url=page.url)
-        maybe_capture_success(page, config, "result_signed_now")
-        return "signed_now"
-
-    raise_with_screenshot(page, config, "signin_not_confirmed", "Sign-in click completed but the page state did not confirm success.")
-
-
-def main() -> None:
+def main() -> int:
     global ACTIVE_LOG_LEVEL
     args = parse_args()
     config = load_config(args)
     ACTIVE_LOG_LEVEL = config.log_level
-    log("config", "loaded runtime configuration", profile_dir=str(config.profile_dir.resolve()), artifact_dir=str(config.artifact_dir.resolve()), dry_run=config.dry_run, headless=config.headless, log_level=config.log_level)
 
-    context = launch_persistent_context(
-        str(config.profile_dir),
-        user_agent=config.user_agent,
-        viewport=DEFAULT_VIEWPORT,
-        locale=config.locale,
-        args=[f"--fingerprint={config.fingerprint_seed}"],
-        headless=config.headless,
-        humanize=True,
+    log(
+        "config",
+        "loaded",
+        base_url=config.base_url,
+        host=config.host,
+        dry_run=config.dry_run,
+        webapp=config.webapp,
+        log_level=config.log_level,
     )
-    page: Page | None = None
+
+    if args.selftest:
+        return selftest(config)
+
+    # node present?
     try:
-        page = context.new_page()
-        configure_page(page, config.timeout_ms)
-        verify_mobile_ua(page, config.user_agent)
-        ensure_logged_in(page, config)
-        open_points_page(page)
-        result = handle_signin(page, config)
-        log("result", result, result=result, url=page.url)
-    except Exception as exc:
-        if page is not None:
-            try:
-                capture_screenshot(page, config.artifact_dir, "top_level_failure")
-            except Exception:
-                pass
-            log("failure", str(exc), level="error", url=page.url)
-        else:
-            log("failure", str(exc), level="error")
-        raise
-    finally:
-        context.close()
+        subprocess.run(["node", "-v"], check=True, capture_output=True)
+    except Exception as e:
+        log("config", "node is required for WASM crypto", level="error", error=str(e))
+        return 2
+
+    client = ProtocolClient(config)
+    try:
+        token = client.login()
+
+        already = False
+        try:
+            status = client.task_all(token)
+            already = bool((status.get("result") or {}).get("checkIn"))
+        except Exception as e:
+            # 522 等源站抖动时跳过状态查询，直接尝试签到
+            log("task", "skip task/all", level="warning", error=str(e)[:200])
+
+        if already:
+            log("result", "already_signed", result="already_signed")
+            return 0
+
+        if config.dry_run:
+            log(
+                "result",
+                "dry_run_ready",
+                result="dry_run_ready",
+                note="use --no-dry-run to POST /api/task",
+            )
+            return 0
+
+        cr = client.checkin(token)
+        j = cr.get("json") or {}
+        if j.get("success") is True:
+            log(
+                "result",
+                "signed_now",
+                result="signed_now",
+                points=(j.get("result") or {}).get("points"),
+            )
+            return 0
+        msg = str(j.get("message") or "")
+        if "已完成" in msg or "已经" in msg or "已签" in msg:
+            log("result", "already_signed", result="already_signed", message=msg)
+            return 0
+        log("result", "failed", level="error", status=cr.get("status"), json=j)
+        return 1
+    except Exception as e:
+        log("failure", str(e), level="error")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

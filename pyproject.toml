@@ -1,12 +1,10 @@
 [project]
-name = "iios-cloakbrowser-setup"
-version = "0.1.0"
-description = "uv-managed CloakBrowser smoke tests for later iios.fun automation"
-readme = "README.local.md"
-requires-python = ">=3.13"
-dependencies = [
-    "cloakbrowser",
-]
+name = "iios-protocol-signin"
+version = "0.2.0"
+description = "Pure-protocol daily sign-in for iios (WASM + urllib)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
 
 [tool.uv]
 package = false

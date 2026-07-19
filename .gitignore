@@ -1,6 +1,7 @@
+.env
 .venv/
 __pycache__/
 *.pyc
-.env
-data/profile/
-data/logs/
+data/
+*.log
+.DS_Store
